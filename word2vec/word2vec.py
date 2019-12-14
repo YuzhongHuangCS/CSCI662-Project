@@ -36,7 +36,8 @@ eval_step = 2000
 eval_words = ['five', 'of', 'going', 'hardware', 'american', 'britain']
 
 # Word2Vec Parameters
-embedding_size = 200 # Dimension of the embedding vector
+embedding_size = 100 # Dimension of the embedding vector
+latent_size = 10
 max_vocabulary_size = 50000 # Total number of different words in the vocabulary
 min_occurrence = 10 # Remove all words that does not appears at least n times
 skip_window = 3 # How many words to consider left and right
@@ -130,16 +131,20 @@ Y = tf.placeholder(tf.int32, shape=[None, 1])
 # (some ops are not compatible on GPU)
 
 # Create the embedding variable (each row represent a word embedding vector)
-embedding = tf.Variable(tf.random_normal([vocabulary_size, embedding_size]))
+embedding = tf.Variable(tf.random_normal([vocabulary_size, latent_size]))
+topics = tf.Variable(tf.random_normal([latent_size, embedding_size]))
+
 # Lookup the corresponding embedding vectors for each sample in X
-X_embed = tf.nn.embedding_lookup(embedding, X)
+words = tf.nn.embedding_lookup(embedding, X)
+words_softmax = tf.nn.softmax(words)
+X_embed = tf.matmul(words_softmax, topics)
 
 # Construct the variables for the NCE loss
 nce_weights = tf.Variable(tf.random_normal([vocabulary_size, embedding_size]))
 nce_biases = tf.Variable(tf.zeros([vocabulary_size]))
 
 # Compute the average NCE loss for the batch
-loss_op = tf.reduce_mean(
+loss_nce = tf.reduce_mean(
     tf.nn.nce_loss(weights=nce_weights,
                    biases=nce_biases,
                    labels=Y,
@@ -147,50 +152,80 @@ loss_op = tf.reduce_mean(
                    num_sampled=num_sampled,
                    num_classes=vocabulary_size))
 
+loss_dirichlet = 0.05 * tf.reduce_mean(tf.reduce_sum(tf.nn.log_softmax(words), axis=1))
+
+topics_norm = topics / tf.sqrt(tf.reduce_sum(tf.square(topics), 1, keepdims=True))
+topics_cosine_sim = tf.matmul(topics_norm, topics_norm, transpose_b=True) - tf.eye(latent_size)
+loss_cosine_sim = 0.1 * tf.reduce_sum(tf.square(topics_cosine_sim))
+
+#loss_op = loss_nce + loss_dirichlet + loss_cosine_sim
+loss_op = loss_nce + loss_dirichlet + loss_cosine_sim
+
 # Define the optimizer
-optimizer = tf.train.GradientDescentOptimizer(learning_rate)
+optimizer = tf.train.AdamOptimizer(learning_rate)
 train_op = optimizer.minimize(loss_op)
 
 # Evaluation
 # Compute the cosine similarity between input data embedding and every embedding vectors
 X_embed_norm = X_embed / tf.sqrt(tf.reduce_sum(tf.square(X_embed)))
-embedding_norm = embedding / tf.sqrt(tf.reduce_sum(tf.square(embedding), 1, keepdims=True))
+embedding_softmax = tf.nn.softmax(embedding)
+embedding_final = tf.matmul(embedding_softmax, topics)
+embedding_norm = embedding_final / tf.sqrt(tf.reduce_sum(tf.square(embedding_final), 1, keepdims=True))
 cosine_sim_op = tf.matmul(X_embed_norm, embedding_norm, transpose_b=True)
 
 # Initialize the variables (i.e. assign their default value)
-init = tf.global_variables_initializer()
-
 with tf.Session() as sess:
 
     # Run the initializer
-    sess.run(init)
+    sess.run(tf.global_variables_initializer())
 
     # Testing data
     x_test = np.array([word2id[w] for w in eval_words])
 
     average_loss = 0
+    average_loss_nce = 0
+    average_loss_dirichlet = 0
+    average_loss_cosine_sim = 0
     for step in range(1, num_steps + 1):
         # Get a new batch of data
         batch_x, batch_y = next_batch(batch_size, num_skips, skip_window)
         # Run training op
-        _, loss = sess.run([train_op, loss_op], feed_dict={X: batch_x, Y: batch_y})
+        _, loss, loss_nce_v, loss_dirichlet_v, loss_cosine_sim_v = sess.run([train_op, loss_op, loss_nce, loss_dirichlet, loss_cosine_sim], feed_dict={X: batch_x, Y: batch_y})
+        #pdb.set_trace()
         average_loss += loss
+        average_loss_nce += loss_nce_v
+        average_loss_dirichlet += loss_dirichlet_v
+        average_loss_cosine_sim += loss_cosine_sim_v
 
         if step % display_step == 0 or step == 1:
             if step > 1:
                 average_loss /= display_step
-            print("Step " + str(step) + ", Average Loss= " + \
-                  "{:.4f}".format(average_loss))
+                average_loss_nce /= display_step
+                average_loss_dirichlet /= display_step
+                average_loss_cosine_sim /= display_step
+            print("Step {}, Average Loss= {:.4f}, NCE Loss = {:.4f}, Dirichlet Loss = {:.4f}, Cosine Sim Loss = {:.4f}".format(step, average_loss, average_loss_nce, average_loss_dirichlet, average_loss_cosine_sim))
             average_loss = 0
+            average_loss_nce = 0
+            average_loss_dirichlet = 0
+            average_loss_cosine_sim = 0
 
         # Evaluation
         if step % eval_step == 0 or step == 1:
             print("Evaluation...")
-            sim = sess.run(cosine_sim_op, feed_dict={X: x_test})
+            sim, scores, emb = sess.run([cosine_sim_op, words_softmax, embedding_softmax], feed_dict={X: x_test})
             for i in range(len(eval_words)):
                 top_k = 8  # number of nearest neighbors
                 nearest = (-sim[i, :]).argsort()[1:top_k + 1]
                 log_str = '"%s" nearest neighbors:' % eval_words[i]
                 for k in range(top_k):
                     log_str = '%s %s,' % (log_str, id2word[nearest[k]])
+                print(log_str)
+                print(scores[i])
+
+            for i in range(latent_size):
+                top_k = 8
+                nearest = (-emb[:, i]).argsort()[:top_k]
+                log_str = 'Top word for topic: {}'.format(i)
+                for k in range(top_k):
+                    log_str = '%s %s(%s),' % (log_str, id2word[nearest[k]], emb[nearest[k], i])
                 print(log_str)
