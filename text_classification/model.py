@@ -80,6 +80,9 @@ class Model(object):
 			fd.create_dataset('labels', (0,), dtype='int32', chunks=(self.args.line,), maxshape=(None,),
 							  compression='gzip',
 							  compression_opts=9)
+			fd.create_dataset('lengths', (0,), dtype='int32', chunks=(self.args.line,), maxshape=(None,),
+							  compression='gzip',
+							  compression_opts=9)
 			fd.create_dataset('features', (0, self.args.length), dtype='int32',
 							  chunks=(self.args.line, self.args.length),
 							  maxshape=(None, self.args.length), compression='gzip', compression_opts=9)
@@ -90,6 +93,7 @@ class Model(object):
 			while True:
 				features = []
 				labels = []
+				lengths = []
 
 				for i in range(self.args.line):
 					line = f.readline()
@@ -99,11 +103,11 @@ class Model(object):
 					label, sentence = line.strip().split('\t', 1)
 					feature = []
 					for word in sentence.split():
-						emb = self.word2idx.get(word, None)
-						if emb is not None:
-							feature.append(emb)
+						emb = self.word2idx.get(word, self.special_symbol['unknown'])
+						feature.append(emb)
 
 					feature = np.asarray(feature)
+					lengths.append(len(feature))
 					if len(feature) < self.args.length:
 						feature = np.pad(feature, (0, self.args.length - len(feature)), mode='constant',
 										 constant_values=self.special_symbol['padding'])
@@ -115,32 +119,32 @@ class Model(object):
 				if len(labels) == 0:
 					break
 				else:
-					yield [np.asarray(features), np.asarray(labels)]
+					yield [np.asarray(features), np.asarray(labels), np.asarray(lengths)]
 
 	def write_hdf5file(self, filename):
 		ds_f = self.f[filename]['features']
 		ds_l = self.f[filename]['labels']
+		ds_len = self.f[filename]['lengths']
 
-		for features, labels in self.read_textfile(filename):
+		for features, labels, lengths in self.read_textfile(filename):
 			idx = len(ds_f)
 			ds_f.resize(idx + len(features), axis=0)
 			ds_f[idx:, :] = features
 			ds_l.resize(idx + len(labels), axis=0)
 			ds_l[idx:] = labels
+			ds_len.resize(idx + len(lengths), axis=0)
+			ds_len[idx:] = lengths
 
 	def read_hdf5file(self, filename, shuffle=False):
 		ds_f = self.f[filename]['features']
 		ds_l = self.f[filename]['labels']
+		ds_len = self.f[filename]['lengths']
 		idx = len(ds_f)
 		i_ary = list(range(0, idx, self.args.line))
 		if shuffle:
 			random.shuffle(i_ary)
 		for i in i_ary:
-			yield [ds_f[i:i + self.args.line, :], ds_l[i:i + self.args.line]]
-
-	@staticmethod
-	def mean_transform(features):
-		return tf.reduce_mean(features, axis=1)
+			yield [ds_f[i:i + self.args.line, :], ds_l[i:i + self.args.line], ds_len[i:i + self.args.line]]
 
 	def sgd(self):
 		word_vocab_size = len(self.word2idx) + len(self.special_symbol)
@@ -148,6 +152,7 @@ class Model(object):
 
 		features = tf.placeholder(tf.int32, shape=(None, self.args.length))
 		labels = tf.placeholder(tf.int32, shape=(None,))
+		lengths = tf.placeholder(tf.float32, shape=(None,))
 
 		if self.args.embedding != '':
 			initial_embedding = np.zeros((word_vocab_size, self.args.dimension), dtype=np.float32)
@@ -158,14 +163,19 @@ class Model(object):
 				if parts[0] in self.word2idx:
 					initial_embedding[self.word2idx[parts[0]]] = np.asarray([np.float32(t) for t in parts[1:]])
 		else:
-			initial_embedding = tf.random_uniform([word_vocab_size, self.args.dimension], -math.sqrt(3), math.sqrt(3))
+			initial_embedding = np.random.uniform(low=-math.sqrt(3), high=math.sqrt(3), size=[word_vocab_size, self.args.dimension]).astype(np.float32)
+			initial_embedding[0] = 0
+			initial_embedding[1] = 0
 
 		word_embedding = tf.Variable(initial_embedding, name="Embedding")
+		#pdb.set_trace()
 		embedded_features = tf.nn.embedding_lookup(word_embedding, features)
 		#pdb.set_trace()
 		W = tf.get_variable('WOutput', shape=(self.args.dimension, 20))
 		embedded_features = tf.tensordot(embedded_features, W, axes=1)
-		hidden_mean = self.mean_transform(embedded_features)
+		#hidden_mean = tf.reduce_mean(embedded_features, axis=1)
+		hidden_mean = tf.reduce_sum(embedded_features, axis=1) / tf.expand_dims(lengths, 1)
+		update_unkown_op = tf.assign(word_embedding[0], tf.reduce_mean(word_embedding[2:], axis=0))
 		#pdb.set_trace()
 		dense_mean = tf.layers.dense(inputs=hidden_mean, units=label_vocab_size, name="Output",
 									 kernel_initializer=tf.glorot_uniform_initializer())
@@ -173,19 +183,13 @@ class Model(object):
 		loss_mean = tf.losses.sparse_softmax_cross_entropy(labels=labels, logits=dense_mean)
 
 		var_embedding = [x for x in tf.trainable_variables() if 'Embedding' in x.name]
-		#var_filter = [x for x in tf.trainable_variables() if 'filter' in x.name]
 		var_output = [x for x in tf.trainable_variables() if 'Output' in x.name]
 
 		lr = tf.Variable(self.args.lr_mean, trainable=False)
 		lr_decay_op = lr.assign(lr * 0.97)
-		train_mean = tf.train.AdamOptimizer(self.args.lr_mean).minimize(loss=loss_mean,
-																		var_list=var_output + var_embedding)
-		'''
-		train_pca = [
-			tf.train.AdamOptimizer(self.args.lr_pca).minimize(loss=self.pca_losses[i], var_list=[var_filter[i]]) for i
-			in range(self.count)]
-		train_output = tf.train.AdamOptimizer(self.args.lr_output).minimize(loss=loss_full, var_list=var_output)
-		'''
+		train_mean = tf.train.AdamOptimizer(self.args.lr_mean).minimize(loss=loss_mean, var_list=var_output + var_embedding)
+
+
 		saver = tf.train.Saver()
 		t = []
 		with tf.Session() as sess:
@@ -197,10 +201,10 @@ class Model(object):
 			times = []
 			for epoch in range(self.args.epoch_mean):
 				trunk = 0
-				for train_features, train_labels in self.read_hdf5file(self.args.prefix + self.args.dataset[0], True):
+				for train_features, train_labels, train_lengths in self.read_hdf5file(self.args.prefix + self.args.dataset[0], True):
 					t1 = time.time()
 					_, train_loss = sess.run([train_mean, loss_mean],
-											 feed_dict={features: train_features, labels: train_labels})
+											 feed_dict={features: train_features, labels: train_labels, lengths: train_lengths})
 					t2 = time.time()
 					times.append(t2-t1)
 					self.log.debug('Epoch: {}, Trunk: {}, Train feature shape: {}, Loss: {}'.format(epoch, trunk,
@@ -210,9 +214,10 @@ class Model(object):
 
 				total = 0
 				diff = 0
-				for test_features, test_labels in self.read_hdf5file(self.args.prefix + self.args.dataset[1]):
+				sess.run(update_unkown_op)
+				for test_features, test_labels, test_lengths in self.read_hdf5file(self.args.prefix + self.args.dataset[1]):
 					predicted_labels = sess.run(predicted_mean,
-												feed_dict={features: test_features, labels: test_labels})
+												feed_dict={features: test_features, labels: test_labels, lengths: test_lengths})
 					total += len(test_labels)
 					diff += np.count_nonzero(test_labels - predicted_labels)
 

@@ -1,1 +1,1 @@
-python main.py -prefix agnews/ -length 160 -dimension 10 agnews_train.txt:agnews_test.txt -line 10000 -epoch_mean 10
+python main.py -prefix agnews/ -length 177 -dimension 100 agnews_train.txt:agnews_test.txt -line 10000 -epoch_mean 20
