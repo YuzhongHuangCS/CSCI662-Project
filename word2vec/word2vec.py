@@ -24,6 +24,8 @@ import zipfile
 import numpy as np
 import tensorflow as tf
 import pdb
+import pickle
+import sys
 
 # Training Parameters
 learning_rate = 0.1
@@ -152,14 +154,15 @@ loss_nce = tf.reduce_mean(
                    num_sampled=num_sampled,
                    num_classes=vocabulary_size))
 
-loss_dirichlet = 0.05 * tf.reduce_mean(tf.reduce_sum(tf.nn.log_softmax(words), axis=1))
+loss_dirichlet = 5e-3 * tf.reduce_mean(tf.reduce_sum(tf.nn.log_softmax(words), axis=1))
 
 topics_norm = topics / tf.sqrt(tf.reduce_sum(tf.square(topics), 1, keepdims=True))
 topics_cosine_sim = tf.matmul(topics_norm, topics_norm, transpose_b=True) - tf.eye(latent_size)
-loss_cosine_sim = 0.1 * tf.reduce_sum(tf.square(topics_cosine_sim))
+loss_cosine_sim = 1e-2 * tf.reduce_sum(tf.square(topics_cosine_sim))
+loss_reg = 1e-3 * (tf.reduce_mean(tf.square(embedding)) + tf.reduce_mean(tf.square(topics)))
 
-#loss_op = loss_nce + loss_dirichlet + loss_cosine_sim
-loss_op = loss_nce + loss_dirichlet + loss_cosine_sim
+#loss_op = loss_nce
+loss_op = loss_nce + loss_dirichlet + loss_cosine_sim + loss_reg
 
 # Define the optimizer
 optimizer = tf.train.AdamOptimizer(learning_rate)
@@ -186,16 +189,18 @@ with tf.Session() as sess:
     average_loss_nce = 0
     average_loss_dirichlet = 0
     average_loss_cosine_sim = 0
+    average_loss_reg = 0
     for step in range(1, num_steps + 1):
         # Get a new batch of data
         batch_x, batch_y = next_batch(batch_size, num_skips, skip_window)
         # Run training op
-        _, loss, loss_nce_v, loss_dirichlet_v, loss_cosine_sim_v = sess.run([train_op, loss_op, loss_nce, loss_dirichlet, loss_cosine_sim], feed_dict={X: batch_x, Y: batch_y})
+        _, loss, loss_nce_v, loss_dirichlet_v, loss_cosine_sim_v, loss_reg_v = sess.run([train_op, loss_op, loss_nce, loss_dirichlet, loss_cosine_sim, loss_reg], feed_dict={X: batch_x, Y: batch_y})
         #pdb.set_trace()
         average_loss += loss
         average_loss_nce += loss_nce_v
         average_loss_dirichlet += loss_dirichlet_v
         average_loss_cosine_sim += loss_cosine_sim_v
+        average_loss_reg += loss_reg_v
 
         if step % display_step == 0 or step == 1:
             if step > 1:
@@ -203,11 +208,13 @@ with tf.Session() as sess:
                 average_loss_nce /= display_step
                 average_loss_dirichlet /= display_step
                 average_loss_cosine_sim /= display_step
-            print("Step {}, Average Loss= {:.4f}, NCE Loss = {:.4f}, Dirichlet Loss = {:.4f}, Cosine Sim Loss = {:.4f}".format(step, average_loss, average_loss_nce, average_loss_dirichlet, average_loss_cosine_sim))
+                average_loss_reg /= display_step
+            print("Step {}, Average Loss= {:.4f}, NCE Loss = {:.4f}, Dirichlet Loss = {:.4f}, Cosine Sim Loss = {:.4f}, Reg Loss = {:.4f}".format(step, average_loss, average_loss_nce, average_loss_dirichlet, average_loss_cosine_sim, average_loss_reg))
             average_loss = 0
             average_loss_nce = 0
             average_loss_dirichlet = 0
             average_loss_cosine_sim = 0
+            average_loss_reg = 0
 
         # Evaluation
         if step % eval_step == 0 or step == 1:
@@ -229,3 +236,19 @@ with tf.Session() as sess:
                 for k in range(top_k):
                     log_str = '%s %s(%s),' % (log_str, id2word[nearest[k]], emb[nearest[k], i])
                 print(log_str)
+
+    print('Saving')
+    # save embedding
+    prefix = sys.argv[1]
+    embed_v, topics_v = sess.run([embedding, topics])
+    with open(prefix + '_embedding.npy', 'wb') as fout:
+        np.save(fout, embed_v)
+    with open(prefix + '_topic.npy', 'wb') as fout:
+        np.save(fout, topics_v)
+    with open(prefix + '_dict.npy', 'wb') as fout:
+        pickle.dump({'id2word': id2word, 'word2id': word2id}, fout, pickle.HIGHEST_PROTOCOL)
+
+    with open(prefix + '_embedding.txt', 'w') as fout:
+        for i in range(len(embed_v)):
+            fout.write(id2word[i] + ' ' + ' '.join([str(v) for v in embed_v[i]]) + '\n')
+    print('All done')
